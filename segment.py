@@ -371,21 +371,14 @@ benchmark_times['13. Visualization'] = time.time() - visualization_start
 min_disparity = 0       # never allow negative shift
 max_disparity = 256     # generous upper limit in pixels
 
-# 14.2 Thin boundaries to reduce computational load
+# 14.2 Pick boundary pixels - keep them ALL this time
 start_step = time.time()
 print("\n=== Stereo Matching ===")
 print(f"Disparity search range: {min_disparity} to {max_disparity} pixels")
 
-# Apply morphological skeletonization to get true 1-pixel skeleton
-left_skeleton = (skeletonize(left_boundary_image > 0) * 255).astype(np.uint8)
-right_skeleton = (skeletonize(right_boundary_image > 0) * 255).astype(np.uint8)
-
-# Get thinned boundary coordinates
-left_thin_coords = np.column_stack(np.where(left_skeleton > 0))
-right_thin_coords = np.column_stack(np.where(right_skeleton > 0))
-
-print(f"Boundary thinning: {len(left_gradient_coords)} -> {len(left_thin_coords)} pixels")
-benchmark_times['14.2 Boundary Thinning'] = time.time() - start_step
+boundary_coords = left_gradient_coords  # (~3.2 × 10^5 points)
+print(f"Stereo on {len(boundary_coords)} boundary pixels (no thinning)")
+benchmark_times['14.2 Boundary Selection'] = time.time() - start_step
 
 # Initialize unified disparity output
 disparity_output = np.full(left_image.shape, np.nan, dtype=np.float32)
@@ -399,67 +392,63 @@ if selected_matching == 'chamfer':
     start_step = time.time()
     print("\n14.3 Running Chamfer distance matching...")
     
-    # Compute distance transform for right skeleton once
-    right_distance_transform = cv2.distanceTransform(
-        255 - right_skeleton, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+    # Compute distance transform for right boundary once
+    right_dt = cv2.distanceTransform(
+        255 - right_boundary_image, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
     )
     
-    # Process thinned boundary pixels
-    chamfer_window_size = 31
-    half_window = chamfer_window_size // 2
+    # Build integral image once (use float64 to avoid overflow)
+    right_dt_ii = right_dt.astype(np.float64).cumsum(axis=0).cumsum(axis=1)
+    
+    # Also build integral image for left boundary to count pixels in O(1)
+    left_bdry_ii = left_boundary_image.astype(np.float64).cumsum(axis=0).cumsum(axis=1)
+    
+    # Process full boundary pixels
+    r = 15  # half window
+    h, w = left_image.shape
+    disp_range = np.arange(0, 257)  # pre-compute once
     matched_count = 0
     
-    for coord in left_thin_coords:
-        y, x = coord
-        
-        # Skip pixels too close to image edges
-        if (y < half_window or y >= left_skeleton.shape[0] - half_window or
-            x < max_disparity or x >= left_skeleton.shape[1] - half_window):
+    for y, x in boundary_coords:
+        # Boundary checks
+        if x < max_disparity + r or x >= w - r or y < r or y >= h - r:
             continue
         
-        # Extract window around left boundary pixel
-        y_min = y - half_window
-        y_max = y + half_window + 1
-        x_min = x - half_window
-        x_max = x + half_window + 1
+        # All candidate x positions on this scan line
+        candidates = x - disp_range
         
-        left_window = left_skeleton[y_min:y_max, x_min:x_max]
+        # Vectorized valid range check
+        valid_mask = (candidates >= r) & (candidates < w - r)
+        valid_candidates = candidates[valid_mask]
+        valid_disparities = disp_range[valid_mask]
         
-        if np.sum(left_window) == 0:  # skip empty windows
+        if len(valid_candidates) == 0:
             continue
         
-        # Vectorized disparity search
-        # Create disparity range
-        disparities = np.arange(min_disparity, min(max_disparity + 1, x + 1))
-        right_xs = x - disparities
+        # Vectorized patch sums using integral image
+        y0 = max(0, y - r - 1)
+        y1 = y + r
+        x0s = np.maximum(0, valid_candidates - r - 1)
+        x1s = valid_candidates + r
         
-        # Extract all candidate windows at once using advanced indexing
-        valid_mask = (right_xs >= half_window) & (right_xs < right_distance_transform.shape[1] - half_window)
-        valid_disparities = disparities[valid_mask]
-        valid_right_xs = right_xs[valid_mask]
-        
-        if len(valid_disparities) == 0:
-            continue
-        
-        # Compute scores for all valid positions
-        scores = np.zeros(len(valid_disparities))
-        left_mask = left_window > 0
-        
-        for i, rx in enumerate(valid_right_xs):
-            right_dt_window = right_distance_transform[y_min:y_max, rx - half_window:rx + half_window + 1]
-            scores[i] = np.sum(right_dt_window[left_mask])
+        scores = (right_dt_ii[y1, x1s] - right_dt_ii[y0, x1s] -
+                  right_dt_ii[y1, x0s] + right_dt_ii[y0, x0s])
         
         # Find best match
         best_idx = np.argmin(scores)
         best_score = scores[best_idx]
-        best_disparity = valid_disparities[best_idx]
         
-        # Store disparity if match was good enough
-        if best_score < np.sum(left_window > 0) * 5:  # adaptive threshold
-            disparity_output[y, x] = best_disparity
+        # Count left boundary pixels in window using integral image
+        lx0 = max(0, x - r - 1)
+        lx1 = x + r
+        left_pixel_count = (left_bdry_ii[y1, lx1] - left_bdry_ii[y0, lx1] -
+                           left_bdry_ii[y1, lx0] + left_bdry_ii[y0, lx0])
+        
+        if best_score < left_pixel_count * 5:
+            disparity_output[y, x] = valid_disparities[best_idx]
             matched_count += 1
     
-    print(f"Chamfer matching: {matched_count}/{len(left_thin_coords)} pixels matched")
+    print(f"Chamfer matching: {matched_count}/{len(boundary_coords)} pixels matched")
     benchmark_times['14.3 Chamfer Matching'] = time.time() - start_step
 
 # 14.4 Block matching (dense SSD)
@@ -476,46 +465,62 @@ elif selected_matching == 'block':
     left_float = left_image.astype(np.float32)
     right_float = right_image.astype(np.float32)
     
-    for coord in left_thin_coords:
-        y, x = coord
-        
-        # Skip pixels too close to image edges
-        if (y < half_block or y >= left_image.shape[0] - half_block or
-            x < max_disparity or x >= left_image.shape[1] - half_block):
-            continue
-        
-        # Extract template block around left pixel
-        template = left_float[y - half_block:y + half_block + 1, 
-                             x - half_block:x + half_block + 1]
-        
-        # Define search region in right image
-        search_x_min = max(0, x - max_disparity - half_block)
-        search_x_max = min(right_image.shape[1] - block_size + 1, x - min_disparity + half_block + 1)
-        
-        if search_x_max <= search_x_min:
-            continue
-            
-        # Extract search region
-        search_region = right_float[y - half_block:y + half_block + 1,
-                                   search_x_min:search_x_max + block_size - 1]
-        
-        # Use matchTemplate for fast SSD computation
-        result = cv2.matchTemplate(search_region, template, cv2.TM_SQDIFF)
-        
-        # Find minimum (best match)
-        min_val, _, min_loc, _ = cv2.minMaxLoc(result)
-        
-        # Convert back to disparity
-        matched_x = search_x_min + min_loc[0] + half_block
-        disparity = x - matched_x
-        
-        # Store disparity if match was good enough and within valid range
-        if (min_val < block_size * block_size * 500 and 
-            min_disparity <= disparity <= max_disparity):
-            disparity_output[y, x] = disparity
-            matched_count += 1
+    # Group pixels by scanline for efficient processing
+    scanline_groups = {}
+    for y, x in boundary_coords:
+        if y not in scanline_groups:
+            scanline_groups[y] = []
+        scanline_groups[y].append(x)
     
-    print(f"Block matching: {matched_count}/{len(left_thin_coords)} pixels matched")
+    # Process each scanline
+    h, w = left_image.shape
+    for y, x_coords in scanline_groups.items():
+        # Skip if too close to edges
+        if y < half_block or y >= h - half_block:
+            continue
+        
+        # Extract full scanline strip from right image
+        strip_top = y - half_block
+        strip_bottom = y + half_block + 1
+        right_strip = right_float[strip_top:strip_bottom, :]
+        
+        # Process each x coordinate on this scanline
+        for x in x_coords:
+            if x < max_disparity + half_block or x >= w - half_block:
+                continue
+            
+            # Extract template from left image
+            template = left_float[strip_top:strip_bottom, 
+                                x - half_block:x + half_block + 1]
+            
+            # Define search range
+            search_start = max(0, x - max_disparity - half_block)
+            search_end = min(w - block_size + 1, x + half_block + 1)
+            
+            if search_end <= search_start:
+                continue
+                
+            # Extract search region from strip
+            search_region = right_strip[:, search_start:search_end + block_size - 1]
+            
+            # One matchTemplate call for entire search range
+            ssd_scores = cv2.matchTemplate(search_region, template, cv2.TM_SQDIFF)
+            
+            # Find minimum
+            min_idx = np.argmin(ssd_scores)
+            min_score = ssd_scores.flat[min_idx]
+            
+            # Convert to disparity
+            matched_x = search_start + min_idx + half_block
+            disparity = x - matched_x
+            
+            # Threshold and store
+            if (min_score < block_size * block_size * 500 and
+                min_disparity <= disparity <= max_disparity):
+                disparity_output[y, x] = disparity
+                matched_count += 1
+    
+    print(f"Block matching: {matched_count}/{len(boundary_coords)} pixels matched")
     benchmark_times['14.4 Block Matching'] = time.time() - start_step
 
 # 14.5 Semi-Global Matching (SGM)
@@ -544,14 +549,14 @@ elif selected_matching == 'sgm':
     invalid_disparity = sgbm.getMinDisparity() - 1
     matched_count = 0
     
-    for coord in left_thin_coords:
+    for coord in boundary_coords:
         y, x = coord
         disp_value = disparity_sgm[y, x]
         if disp_value != invalid_disparity and disp_value >= min_disparity:  # valid disparity
             disparity_output[y, x] = disp_value
             matched_count += 1
     
-    print(f"SGM matching: {matched_count}/{len(left_thin_coords)} boundary pixels have valid disparities")
+    print(f"SGM matching: {matched_count}/{len(boundary_coords)} boundary pixels have valid disparities")
     benchmark_times['14.5 SGM'] = time.time() - start_step
 
 # 14.6 Sparse feature (SIFT/ORB) fallback
@@ -623,9 +628,9 @@ if len(valid_disparities) > 0:
     print(f"  Max disparity: {valid_disparities.max():.1f}")
     print(f"  Mean disparity: {valid_disparities.mean():.1f}")
     
-    # Create colormap visualization
-    disparity_vis = disparity_output.copy()
-    disparity_vis[np.isnan(disparity_vis)] = 0
+    # Create colormap visualization with clipping for safety
+    disparity_vis = np.clip(disparity_output, 0, max_disparity)
+    disparity_vis[np.isnan(disparity_output)] = 0
     disparity_vis_normalized = (disparity_vis / max_disparity * 255).astype(np.uint8)
     disparity_colored = cv2.applyColorMap(disparity_vis_normalized, cv2.COLORMAP_JET)
     
