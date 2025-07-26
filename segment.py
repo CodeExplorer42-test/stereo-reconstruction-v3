@@ -362,3 +362,274 @@ print("\n=== Benchmark Summary ===")
 for step, duration in benchmark_times.items():
     print(f"{step}: {duration:.3f}s")
 print(f"Total time: {time.time() - start_total:.3f}s")
+
+# ============================================================
+# 14. Stereo Matching
+# ============================================================
+
+# 14.1 Define absolute disparity search window
+min_disparity = 0       # never allow negative shift
+max_disparity = 256     # generous upper limit in pixels
+
+# 14.2 Build scan-line lookup for boundary pixels
+start_step = time.time()
+print("\n=== Stereo Matching ===")
+print(f"Disparity search range: {min_disparity} to {max_disparity} pixels")
+
+# Create lookup dictionary for epipolar search
+epipolar_lookup = {}
+for coord in left_gradient_coords:
+    y, x = coord
+    # For rectified images, corresponding points lie on same horizontal line
+    candidate_x = np.arange(x - max_disparity, x - min_disparity + 1)
+    candidate_x = candidate_x[(candidate_x >= 0) & (candidate_x < right_boundary_image.shape[1])]
+    if len(candidate_x) > 0:
+        epipolar_lookup[(y, x)] = candidate_x
+
+print(f"Built epipolar lookup for {len(epipolar_lookup)} boundary pixels")
+benchmark_times['14.2 Epipolar Lookup'] = time.time() - start_step
+
+# Initialize unified disparity output
+disparity_output = np.full(left_image.shape, np.nan, dtype=np.float32)
+
+# Select matching algorithm
+selected_matching = 'chamfer'  # or 'block', 'sgm', 'sift'
+print(f"\nSelected matching algorithm: {selected_matching}")
+
+# 14.3 Edge-based Chamfer along the line
+if selected_matching == 'chamfer':
+    start_step = time.time()
+    print("\n14.3 Running Chamfer distance matching...")
+    
+    # Compute distance transform for right boundary image once
+    right_distance_transform = cv2.distanceTransform(
+        255 - right_boundary_image, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+    )
+    
+    # Process each boundary pixel
+    chamfer_window_size = 31
+    half_window = chamfer_window_size // 2
+    matched_count = 0
+    
+    for (y, x), candidate_xs in epipolar_lookup.items():
+        # Extract window around left boundary pixel
+        y_min = max(0, y - half_window)
+        y_max = min(left_boundary_image.shape[0], y + half_window + 1)
+        x_min = max(0, x - half_window)
+        x_max = min(left_boundary_image.shape[1], x + half_window + 1)
+        
+        left_window = left_boundary_image[y_min:y_max, x_min:x_max]
+        
+        # Find best match along epipolar line
+        best_score = float('inf')
+        best_disparity = 0
+        
+        for right_x in candidate_xs:
+            # Extract corresponding window from right distance transform
+            right_x_min = max(0, right_x - half_window)
+            right_x_max = min(right_distance_transform.shape[1], right_x + half_window + 1)
+            
+            # Handle window size mismatch at image borders
+            if (right_x_max - right_x_min) != (x_max - x_min):
+                continue
+            if (y_max - y_min) != left_window.shape[0]:
+                continue
+                
+            right_dt_window = right_distance_transform[y_min:y_max, right_x_min:right_x_max]
+            
+            # Compute Chamfer score: sum of distances where left has boundaries
+            score = np.sum(right_dt_window[left_window > 0])
+            
+            if score < best_score:
+                best_score = score
+                best_disparity = x - right_x
+        
+        # Store disparity if match was good enough
+        if best_score < chamfer_window_size * chamfer_window_size * 10:  # threshold
+            disparity_output[y, x] = best_disparity
+            matched_count += 1
+    
+    print(f"Chamfer matching: {matched_count}/{len(epipolar_lookup)} pixels matched")
+    benchmark_times['14.3 Chamfer Matching'] = time.time() - start_step
+
+# 14.4 Block matching (dense SSD)
+elif selected_matching == 'block':
+    start_step = time.time()
+    print("\n14.4 Running block matching (SSD)...")
+    
+    # Use rectified grayscale images for texture
+    block_size = 11
+    half_block = block_size // 2
+    matched_count = 0
+    
+    for (y, x), candidate_xs in epipolar_lookup.items():
+        # Extract block around left pixel
+        y_min = max(0, y - half_block)
+        y_max = min(left_image.shape[0], y + half_block + 1)
+        x_min = max(0, x - half_block)
+        x_max = min(left_image.shape[1], x + half_block + 1)
+        
+        left_block = left_image[y_min:y_max, x_min:x_max].astype(np.float32)
+        
+        # Find best match along epipolar line
+        best_ssd = float('inf')
+        best_disparity = 0
+        
+        for right_x in candidate_xs:
+            # Extract corresponding block from right image
+            right_x_min = max(0, right_x - half_block)
+            right_x_max = min(right_image.shape[1], right_x + half_block + 1)
+            
+            # Handle window size mismatch at image borders
+            if (right_x_max - right_x_min) != (x_max - x_min):
+                continue
+            if (y_max - y_min) != left_block.shape[0]:
+                continue
+                
+            right_block = right_image[y_min:y_max, right_x_min:right_x_max].astype(np.float32)
+            
+            # Compute sum of squared differences
+            ssd = np.sum((left_block - right_block) ** 2)
+            
+            if ssd < best_ssd:
+                best_ssd = ssd
+                best_disparity = x - right_x
+        
+        # Store disparity if match was good enough
+        if best_ssd < block_size * block_size * 1000:  # threshold
+            disparity_output[y, x] = best_disparity
+            matched_count += 1
+    
+    print(f"Block matching: {matched_count}/{len(epipolar_lookup)} pixels matched")
+    benchmark_times['14.4 Block Matching'] = time.time() - start_step
+
+# 14.5 Semi-Global Matching (SGM)
+elif selected_matching == 'sgm':
+    start_step = time.time()
+    print("\n14.5 Running Semi-Global Matching (SGM)...")
+    
+    # Create SGBM matcher
+    sgbm = cv2.StereoSGBM_create(
+        minDisparity=min_disparity,
+        numDisparities=max_disparity - min_disparity,
+        blockSize=5,
+        P1=8 * 3 * 5**2,
+        P2=32 * 3 * 5**2,
+        disp12MaxDiff=1,
+        uniquenessRatio=10,
+        speckleWindowSize=100,
+        speckleRange=32
+    )
+    
+    # Run SGM on full rectified images
+    disparity_sgm = sgbm.compute(left_image, right_image).astype(np.float32) / 16.0
+    
+    # Mask to keep only boundary pixels
+    matched_count = 0
+    for coord in left_gradient_coords:
+        y, x = coord
+        if disparity_sgm[y, x] > 0:  # valid disparity
+            disparity_output[y, x] = disparity_sgm[y, x]
+            matched_count += 1
+    
+    print(f"SGM matching: {matched_count}/{len(left_gradient_coords)} boundary pixels have valid disparities")
+    benchmark_times['14.5 SGM'] = time.time() - start_step
+
+# 14.6 Sparse feature (SIFT/ORB) fallback
+elif selected_matching == 'sift':
+    start_step = time.time()
+    print("\n14.6 Running SIFT feature matching...")
+    
+    # Create SIFT detector
+    sift = cv2.SIFT_create()
+    
+    # Detect keypoints on gradient images (where edges are)
+    kp_left, desc_left = sift.detectAndCompute(left_gradient_normalized, None)
+    kp_right, desc_right = sift.detectAndCompute(right_gradient_normalized, None)
+    
+    print(f"Detected keypoints - left: {len(kp_left)}, right: {len(kp_right)}")
+    
+    # Match descriptors
+    if desc_left is not None and desc_right is not None:
+        bf = cv2.BFMatcher()
+        matches = bf.knnMatch(desc_left, desc_right, k=2)
+        
+        # Apply Lowe's ratio test
+        good_matches = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append(m)
+        
+        print(f"Good matches after ratio test: {len(good_matches)}")
+        
+        # Process matches that land on boundaries
+        matched_count = 0
+        for match in good_matches:
+            # Get coordinates
+            left_pt = kp_left[match.queryIdx].pt
+            right_pt = kp_right[match.trainIdx].pt
+            
+            x_left, y_left = int(left_pt[0]), int(left_pt[1])
+            x_right, y_right = int(right_pt[0]), int(right_pt[1])
+            
+            # Check if both points are on boundaries and on same epipolar line
+            if (0 <= y_left < left_boundary_image.shape[0] and
+                0 <= x_left < left_boundary_image.shape[1] and
+                0 <= y_right < right_boundary_image.shape[0] and
+                0 <= x_right < right_boundary_image.shape[1] and
+                left_boundary_image[y_left, x_left] > 0 and
+                right_boundary_image[y_right, x_right] > 0 and
+                abs(y_left - y_right) < 2):  # rectified constraint
+                
+                disparity = x_left - x_right
+                if min_disparity <= disparity <= max_disparity:
+                    disparity_output[y_left, x_left] = disparity
+                    matched_count += 1
+    
+    print(f"SIFT matching: {matched_count} boundary pixels matched")
+    benchmark_times['14.6 SIFT Matching'] = time.time() - start_step
+
+# 14.7 Save disparity visualization
+start_step = time.time()
+valid_disparities = disparity_output[~np.isnan(disparity_output)]
+if len(valid_disparities) > 0:
+    print(f"\nDisparity statistics:")
+    print(f"  Valid pixels: {len(valid_disparities)}")
+    print(f"  Min disparity: {valid_disparities.min():.1f}")
+    print(f"  Max disparity: {valid_disparities.max():.1f}")
+    print(f"  Mean disparity: {valid_disparities.mean():.1f}")
+    
+    # Create colormap visualization
+    disparity_vis = disparity_output.copy()
+    disparity_vis[np.isnan(disparity_vis)] = 0
+    disparity_vis_normalized = (disparity_vis / max_disparity * 255).astype(np.uint8)
+    disparity_colored = cv2.applyColorMap(disparity_vis_normalized, cv2.COLORMAP_JET)
+    
+    # Mask out invalid pixels
+    mask = ~np.isnan(disparity_output)
+    disparity_colored[~mask] = 0
+    
+    cv2.imwrite(f'disparity_{selected_matching}.png', disparity_colored)
+    print(f"Saved disparity map: disparity_{selected_matching}.png")
+    
+    # Quick numeric sanity check
+    print("\nSample disparities (10 random boundary pixels):")
+    valid_indices = np.argwhere(~np.isnan(disparity_output))
+    if len(valid_indices) >= 10:
+        sample_indices = valid_indices[np.random.choice(len(valid_indices), 10, replace=False)]
+        for idx in sample_indices:
+            y, x = idx
+            disp = disparity_output[y, x]
+            print(f"  Pixel ({y}, {x}): disparity = {disp:.1f} px")
+else:
+    print("\nNo valid disparities found!")
+
+benchmark_times['14.7 Disparity Visualization'] = time.time() - start_step
+
+# Final benchmark update
+print("\n=== Final Benchmark Summary ===")
+for step, duration in benchmark_times.items():
+    print(f"{step}: {duration:.3f}s")
+print(f"Total time: {time.time() - start_total:.3f}s")
